@@ -2010,7 +2010,19 @@ fn process_viewport_command(
             window.set_title(&title);
         }
         ViewportCommand::Transparent(v) => window.set_transparent(v),
-        ViewportCommand::Visible(v) => window.set_visible(v),
+        ViewportCommand::Visible(v) => {
+            window.set_visible(v);
+            // The platform reports the new occlusion state only later (macOS some 60 to 100 ms after
+            // the window is ordered out), and until then eframe would paint every pass into a window
+            // that is no longer shown. On macOS such a paint waits for a drawable the hidden layer
+            // never gives back, which blocks the main thread for Core Animation's 1 s timeout. So the
+            // viewport counts as occluded from the moment it is hidden, and as shown from the moment it
+            // is shown, until the platform's own occlusion event says otherwise. Where the platform
+            // cannot hide a window (`is_visible` is `None`, as on Wayland), nothing changes.
+            if window.is_visible() == Some(v) {
+                info.occluded = Some(!v);
+            }
+        }
         ViewportCommand::OuterPosition(pos) => {
             window.set_outer_position(PhysicalPosition::new(
                 pixels_per_point * pos.x,
