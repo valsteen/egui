@@ -18,13 +18,209 @@ use crate::{
     },
 };
 
-/// Minimum interval between repaints for invisible windows.
+/// Minimum interval between consecutive self-requested repaints for invisible windows.
 ///
 /// On Windows, invisible windows don't receive `RedrawRequested` events,
-/// so we throttle their repaints to avoid busy-looping while still
-/// processing viewport commands like `Visible(true)`.
+/// so we throttle continuous self-requesting repaint loops while hidden to avoid
+/// busy-looping while still running idle wakeups (such as a global hotkey calling
+/// `request_repaint` to send `Visible(true)`) promptly.
 /// See <https://github.com/emilk/egui/issues/7776>.
 const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Tracks whether an invisible window's `run_ui_and_paint` pass on the current thread
+/// synchronously requested another rapid repaint (`delay < INVISIBLE_WINDOW_REPAINT_INTERVAL`).
+///
+/// Background-thread wakeups (such as a global hotkey) run on another thread where this
+/// slot is `None`, so they never trip the self-requesting hidden loop detector.
+#[derive(Clone, Copy)]
+struct ActiveInvisiblePass {
+    viewport_id: egui::ViewportId,
+    requested_rapid_repaint: bool,
+}
+
+thread_local! {
+    static ACTIVE_INVISIBLE_PASS: core::cell::Cell<Option<ActiveInvisiblePass>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Records a repaint request made on the current thread so [`WinitAppWrapper`] knows
+/// whether an invisible pass requested another pass sooner than
+/// [`INVISIBLE_WINDOW_REPAINT_INTERVAL`].
+pub(crate) fn note_repaint_requested_on_this_thread(
+    viewport_id: egui::ViewportId,
+    delay: Duration,
+) {
+    if delay >= INVISIBLE_WINDOW_REPAINT_INTERVAL {
+        return;
+    }
+    ACTIVE_INVISIBLE_PASS.with(|slot| {
+        if let Some(mut active) = slot.get()
+            && active.viewport_id == viewport_id
+        {
+            active.requested_rapid_repaint = true;
+            slot.set(Some(active));
+        }
+    });
+}
+
+struct InvisiblePassGuard {
+    previous: Option<ActiveInvisiblePass>,
+    active: bool,
+}
+
+impl InvisiblePassGuard {
+    fn enter(viewport_id: Option<egui::ViewportId>) -> Self {
+        let previous = ACTIVE_INVISIBLE_PASS.with(|slot| {
+            slot.replace(viewport_id.map(|viewport_id| ActiveInvisiblePass {
+                viewport_id,
+                requested_rapid_repaint: false,
+            }))
+        });
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        self.active = false;
+        let previous = self.previous.take();
+        ACTIVE_INVISIBLE_PASS
+            .with(|slot| slot.replace(previous))
+            .is_some_and(|active| active.requested_rapid_repaint)
+    }
+}
+
+impl Drop for InvisiblePassGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let previous = self.previous.take();
+            ACTIVE_INVISIBLE_PASS.with(|slot| {
+                slot.set(previous);
+            });
+        }
+    }
+}
+
+/// Per-window throttle state while a window is invisible or minimized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowThrottleState {
+    /// Consecutive invisible passes that ended still invisible after requesting a
+    /// rapid repaint (`delay < INVISIBLE_WINDOW_REPAINT_INTERVAL`).
+    ///
+    /// A visible-to-hidden transition can leave `egui`'s `outstanding = 1` settling
+    /// pass in flight, which triggers one rapid repaint before `egui` resets
+    /// `repaint_delay` to `Duration::MAX`. Letting that first settling pass run
+    /// unthrottled lets `egui` reach idle immediately after hiding; a second
+    /// consecutive rapid self-request means the app is looping while hidden
+    /// (<https://github.com/emilk/egui/issues/7776>) and engages the 100 ms cap.
+    consecutive_self_requested: u8,
+
+    /// Earliest instant a throttled repaint is allowed to run.
+    next_allowed_repaint: Option<Instant>,
+}
+
+/// Tracks hidden-window repaint throttling independently per window.
+struct InvisibleWindowThrottles<K> {
+    per_window: HashMap<K, WindowThrottleState>,
+}
+
+impl<K> Default for InvisibleWindowThrottles<K> {
+    fn default() -> Self {
+        Self {
+            per_window: HashMap::default(),
+        }
+    }
+}
+
+impl<K: Copy + Eq + core::hash::Hash> InvisibleWindowThrottles<K> {
+    /// Clears any throttle state once a window becomes visible or disappears.
+    fn clear(&mut self, window_id: K) {
+        self.per_window.remove(&window_id);
+    }
+
+    /// Clamps a `UserEvent::RequestRepaint` timestamp for an invisible window.
+    ///
+    /// Idle wakeups and unthrottled settling passes keep `when` unchanged.
+    /// While throttled, rapid repaints are delayed to `next_allowed_repaint`,
+    /// while future-dated `RepaintAt` deadlines (`>= next_allowed_repaint`) are
+    /// never pulled earlier.
+    fn clamp_user_repaint(&self, window_id: K, when: Instant) -> Instant {
+        match self
+            .per_window
+            .get(&window_id)
+            .and_then(|state| state.next_allowed_repaint)
+        {
+            Some(next_allowed) => when.max(next_allowed),
+            None => when,
+        }
+    }
+
+    /// Updates throttle state after an invisible pass finishes.
+    ///
+    /// Returns the earliest instant a subsequent rapid repaint may run, or `None`
+    /// if the window is not throttled.
+    fn finish_invisible_pass(
+        &mut self,
+        window_id: K,
+        now: Instant,
+        still_invisible: bool,
+        self_requested_rapid_repaint: bool,
+    ) -> Option<Instant> {
+        if !still_invisible || !self_requested_rapid_repaint {
+            self.per_window.remove(&window_id);
+            return None;
+        }
+
+        let state = self
+            .per_window
+            .entry(window_id)
+            .or_insert(WindowThrottleState {
+                consecutive_self_requested: 0,
+                next_allowed_repaint: None,
+            });
+        state.consecutive_self_requested = state.consecutive_self_requested.saturating_add(1);
+        if state.consecutive_self_requested >= 2 {
+            let next_allowed = now + INVISIBLE_WINDOW_REPAINT_INTERVAL;
+            state.next_allowed_repaint = Some(next_allowed);
+            Some(next_allowed)
+        } else {
+            state.next_allowed_repaint = None;
+            None
+        }
+    }
+}
+
+fn event_result_requests_rapid_repaint(
+    event_result: &Result<EventResult>,
+    window_id: WindowId,
+    now: Instant,
+) -> bool {
+    match event_result {
+        Ok(EventResult::RepaintNow(id) | EventResult::RepaintNext(id)) => *id == window_id,
+        Ok(EventResult::RepaintAt(id, when)) => {
+            *id == window_id && *when < now + INVISIBLE_WINDOW_REPAINT_INTERVAL
+        }
+        _ => false,
+    }
+}
+
+fn clamp_event_result_for_throttle(
+    event_result: Result<EventResult>,
+    window_id: WindowId,
+    now: Instant,
+    next_allowed: Instant,
+) -> Result<EventResult> {
+    match event_result {
+        Ok(EventResult::RepaintNow(id) | EventResult::RepaintNext(id)) if id == window_id => {
+            Ok(EventResult::RepaintAt(id, now.max(next_allowed)))
+        }
+        Ok(EventResult::RepaintAt(id, when)) if id == window_id => {
+            Ok(EventResult::RepaintAt(id, when.max(next_allowed)))
+        }
+        other => other,
+    }
+}
 
 /// How long to wait for a requested `RedrawRequested` before running the app logic anyway.
 ///
@@ -92,6 +288,9 @@ struct WinitAppWrapper<T: WinitApp> {
     /// Windows we asked to redraw, and when to give up waiting for their `RedrawRequested`.
     windows_redraw_deadlines: HashMap<WindowId, Instant>,
 
+    /// Per-window throttle state while a window is invisible or minimized.
+    invisible_throttles: InvisibleWindowThrottles<WindowId>,
+
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
@@ -102,6 +301,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         Self {
             windows_next_repaint_times: HashMap::default(),
             windows_redraw_deadlines: HashMap::default(),
+            invisible_throttles: InvisibleWindowThrottles::default(),
             winit_app,
             return_result: Ok(()),
             run_and_return,
@@ -222,6 +422,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                     if is_invisible_or_minimized(&window) {
                         invisible_window_ids.push(*window_id);
                     } else {
+                        self.invisible_throttles.clear(*window_id);
                         log::trace!("request_redraw for {window_id:?}");
                         // Don't switch to `ControlFlow::Poll` here. `request_redraw`
                         // is enough to wake the event loop, and on Wayland the
@@ -235,6 +436,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                             .or_insert(now + MISSED_REDRAW_TIMEOUT);
                     }
                 } else {
+                    self.invisible_throttles.clear(*window_id);
                     log::trace!("No window found for {window_id:?}");
                 }
                 false
@@ -244,22 +446,38 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         // RedrawRequested events on Windows. This ensures that viewport
         // commands like Visible(true) are still processed.
         for window_id in &invisible_window_ids {
+            let viewport_id = self.winit_app.viewport_id_from_window_id(*window_id);
+            let pass_guard = InvisiblePassGuard::enter(viewport_id);
             let event_result =
                 self.winit_app
                     .run_ui_and_paint(event_loop, *window_id, PassMode::Full);
-            self.handle_event_result(event_loop, event_result);
-        }
+            let requested_via_callback = pass_guard.finish();
 
-        // Throttle any already-scheduled repaints for invisible windows
-        // to avoid busy-looping. If no repaint was requested by the app,
-        // the window will simply sleep.
-        // See: https://github.com/emilk/egui/issues/7776
-        if !invisible_window_ids.is_empty() {
-            let next_paint = Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL;
-            for window_id in &invisible_window_ids {
+            let pass_end = Instant::now();
+            let still_invisible = self
+                .winit_app
+                .window(*window_id)
+                .is_some_and(|window| is_invisible_or_minimized(&window));
+            let self_requested_rapid = requested_via_callback
+                || event_result_requests_rapid_repaint(&event_result, *window_id, pass_end);
+            let next_allowed = self.invisible_throttles.finish_invisible_pass(
+                *window_id,
+                pass_end,
+                still_invisible,
+                self_requested_rapid,
+            );
+
+            let event_result = if let Some(next_allowed) = next_allowed {
+                clamp_event_result_for_throttle(event_result, *window_id, pass_end, next_allowed)
+            } else {
+                event_result
+            };
+            self.handle_event_result(event_loop, event_result);
+
+            if let Some(next_allowed) = next_allowed {
                 self.windows_next_repaint_times
                     .entry(*window_id)
-                    .and_modify(|t| *t = (*t).min(next_paint));
+                    .and_modify(|t| *t = (*t).max(next_allowed));
             }
         }
 
@@ -370,14 +588,15 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                         if let Some(window_id) =
                             self.winit_app.window_id_from_viewport_id(viewport_id)
                         {
-                            // Throttle repaints for invisible windows to prevent
-                            // high CPU usage on Windows.
-                            // See: https://github.com/emilk/egui/issues/7776
+                            // Throttle only sustained self-requesting hidden repaint loops
+                            // (emilk/egui#7776) without delaying idle external wakeups or
+                            // pulling future-dated deadlines earlier.
                             let when = if let Some(window) = self.winit_app.window(window_id)
                                 && is_invisible_or_minimized(&window)
                             {
-                                when.max(Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL)
+                                self.invisible_throttles.clamp_user_repaint(window_id, when)
                             } else {
+                                self.invisible_throttles.clear(window_id);
                                 when
                             };
                             Ok(EventResult::RepaintAt(window_id, when))
@@ -416,13 +635,20 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
 
         // Nb: Make sure this guard is dropped after this function returns.
         event_loop_context::with_event_loop_context(event_loop, move || {
-            let event_result = match event {
-                winit::event::WindowEvent::RedrawRequested => {
-                    self.windows_redraw_deadlines.remove(&window_id);
-                    self.winit_app
-                        .run_ui_and_paint(event_loop, window_id, PassMode::Full)
-                }
-                _ => self.winit_app.window_event(event_loop, window_id, event),
+            if self
+                .winit_app
+                .window(window_id)
+                .is_none_or(|window| !is_invisible_or_minimized(&window))
+            {
+                self.invisible_throttles.clear(window_id);
+            }
+
+            let event_result = if event == winit::event::WindowEvent::RedrawRequested {
+                self.windows_redraw_deadlines.remove(&window_id);
+                self.winit_app
+                    .run_ui_and_paint(event_loop, window_id, PassMode::Full)
+            } else {
+                self.winit_app.window_event(event_loop, window_id, event)
             };
 
             self.handle_event_result(event_loop, event_result);
@@ -633,4 +859,349 @@ pub enum EframePumpStatus {
 
     /// The exit code for the application
     Exit(i32),
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+    use std::{sync::Arc, time::Instant};
+
+    use egui::{RawInput, ViewportId, mutex::Mutex};
+
+    use super::{
+        INVISIBLE_WINDOW_REPAINT_INTERVAL, InvisiblePassGuard, InvisibleWindowThrottles,
+        clamp_event_result_for_throttle, event_result_requests_rapid_repaint,
+        note_repaint_requested_on_this_thread,
+    };
+    use crate::native::winit_integration::EventResult;
+
+    fn wired_context() -> (egui::Context, Arc<Mutex<Vec<(ViewportId, Duration)>>>) {
+        let ctx = egui::Context::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        ctx.set_request_repaint_callback(move |info| {
+            note_repaint_requested_on_this_thread(info.viewport_id, info.delay);
+            recorded.lock().push((info.viewport_id, info.delay));
+        });
+        (ctx, events)
+    }
+
+    #[test]
+    fn idle_hidden_wakeup_runs_immediately() {
+        let mut throttles = InvisibleWindowThrottles::default();
+        let window_id = 1_u64;
+        let t0 = Instant::now();
+
+        let scheduled = throttles.clamp_user_repaint(window_id, t0);
+        assert_eq!(
+            scheduled, t0,
+            "idle hidden window must not wait for the 100 ms throttle"
+        );
+
+        let next_allowed = throttles.finish_invisible_pass(window_id, t0, false, true);
+        assert_eq!(
+            next_allowed, None,
+            "pass that made the window visible must not engage a hidden throttle"
+        );
+    }
+
+    #[test]
+    fn post_dismissal_settling_and_immediate_resummon_run_unthrottled() {
+        let (ctx, events) = wired_context();
+        let mut throttles = InvisibleWindowThrottles::default();
+        let window_id = 1_u64;
+        let t0 = Instant::now();
+
+        // Visible dismissal pass where App::ui calls request_repaint(), leaving outstanding = 1.
+        ctx.run_ui(RawInput::default(), |ui| {
+            ui.ctx().request_repaint();
+        })
+        .drop_without_applying_deltas();
+        events.lock().clear();
+
+        // Hidden pass 1: egui drains outstanding 1 -> 0 and emits one settling repaint.
+        let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+        let _ = ctx.run_logic(&RawInput::default(), |_ctx| {});
+        let requested_1 = guard.finish();
+        assert!(
+            requested_1,
+            "draining outstanding = 1 during pass 1 emits a settling rapid repaint"
+        );
+        assert_eq!(
+            throttles.finish_invisible_pass(window_id, t0, true, requested_1),
+            None,
+            "first settling pass after hide must remain unthrottled"
+        );
+
+        // Settling repaint arrives immediately while hidden.
+        let t1 = t0 + Duration::from_millis(1);
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, t1),
+            t1,
+            "settling repaint must not be delayed by 100 ms"
+        );
+
+        // Hidden pass 2: outstanding is 0, so egui resets repaint_delay to Duration::MAX.
+        events.lock().clear();
+        let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+        let _ = ctx.run_logic(&RawInput::default(), |_ctx| {});
+        let requested_2 = guard.finish();
+        assert!(
+            !requested_2,
+            "settled hidden pass must emit no further rapid repaint"
+        );
+        assert_eq!(
+            throttles.finish_invisible_pass(window_id, t1, true, requested_2),
+            None,
+            "settled hidden pass must reset throttle state to idle"
+        );
+
+        // Immediate re-summon 1 ms later fires a real callback and runs without delay.
+        ctx.request_repaint();
+        let fired = events.lock().len();
+        assert_eq!(
+            fired, 1,
+            "settled hidden context must forward an immediate re-summon request_repaint"
+        );
+        let t2 = t1 + Duration::from_millis(1);
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, t2),
+            t2,
+            "immediate re-summon right after settling must not be throttled"
+        );
+    }
+
+    #[test]
+    fn window_events_and_future_timers_do_not_throttle_resummon() {
+        let (ctx, _events) = wired_context();
+        let mut throttles = InvisibleWindowThrottles::default();
+        let window_id = 1_u64;
+        let t0 = Instant::now();
+
+        // Drain initial default outstanding = 1 while visible.
+        ctx.run_ui(RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        ctx.run_ui(RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+
+        // Simulate Focused(false), a pre-hide timer scheduling a 5 s future timer, and Occluded(true).
+        for step in 0_u64..3 {
+            let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+            let _ = ctx.run_logic(&RawInput::default(), |ctx| {
+                if step == 1 {
+                    ctx.request_repaint_after(Duration::from_secs(5));
+                }
+            });
+            let requested_rapid = guard.finish();
+            assert!(
+                !requested_rapid,
+                "idle or >= 100 ms timer hidden passes must not count as rapid self-requests"
+            );
+            assert_eq!(
+                throttles.finish_invisible_pass(
+                    window_id,
+                    t0 + Duration::from_millis(step * 10),
+                    true,
+                    requested_rapid,
+                ),
+                None,
+                "non-looping hidden passes must leave throttle unengaged"
+            );
+        }
+
+        let resummon_at = t0 + Duration::from_millis(25);
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, resummon_at),
+            resummon_at,
+            "re-summon after Focused(false)/Occluded(true)/future timer must run immediately"
+        );
+    }
+
+    #[test]
+    fn continuous_self_requesting_hidden_loop_is_throttled() {
+        let (ctx, _events) = wired_context();
+        let mut throttles = InvisibleWindowThrottles::default();
+        let window_id = 1_u64;
+        let t0 = Instant::now();
+
+        // Pass 1: app self-requests immediate repaint while hidden.
+        let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+        let _ = ctx.run_logic(&RawInput::default(), |ctx| {
+            ctx.request_repaint();
+        });
+        assert!(
+            guard.finish(),
+            "in-pass request_repaint must be detected as a rapid self-request"
+        );
+        assert_eq!(
+            throttles.finish_invisible_pass(window_id, t0, true, true),
+            None,
+            "first rapid pass stays unthrottled to allow settling"
+        );
+
+        // Pass 2: app self-requests again -> engages 100 ms throttle.
+        let t1 = t0 + Duration::from_millis(1);
+        let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+        let _ = ctx.run_logic(&RawInput::default(), |ctx| {
+            ctx.request_repaint();
+        });
+        assert!(
+            guard.finish(),
+            "second consecutive self-requesting pass must be detected"
+        );
+        let expected_next = t1 + INVISIBLE_WINDOW_REPAINT_INTERVAL;
+        assert_eq!(
+            throttles.finish_invisible_pass(window_id, t1, true, true),
+            Some(expected_next),
+            "second consecutive self-requesting hidden pass must engage 100 ms throttle"
+        );
+
+        // Subsequent immediate UserEvent::RequestRepaint is held until t1 + 100 ms.
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, t1),
+            expected_next,
+            "continuous hidden loop must be capped to INVISIBLE_WINDOW_REPAINT_INTERVAL"
+        );
+
+        // Short-delay loop (5 ms) is also detected and stays throttled.
+        let t2 = expected_next;
+        let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+        let _ = ctx.run_logic(&RawInput::default(), |ctx| {
+            ctx.request_repaint_after(Duration::from_millis(5));
+        });
+        assert!(
+            guard.finish(),
+            "in-pass 5 ms request_repaint_after must count as a rapid self-request"
+        );
+        let expected_next_2 = t2 + INVISIBLE_WINDOW_REPAINT_INTERVAL;
+        assert_eq!(
+            throttles.finish_invisible_pass(window_id, t2, true, true),
+            Some(expected_next_2),
+            "continued loop must advance the 100 ms throttle window"
+        );
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, t2 + Duration::from_millis(5)),
+            expected_next_2,
+            "5 ms hidden loop must be clamped to 100 ms"
+        );
+    }
+
+    #[test]
+    fn future_repaint_at_deadline_is_never_pulled_earlier() {
+        let mut throttles = InvisibleWindowThrottles::default();
+        let window_id = winit::window::WindowId::dummy();
+        let t0 = Instant::now();
+
+        let _ = throttles.finish_invisible_pass(window_id, t0, true, true);
+        let next_allowed = throttles
+            .finish_invisible_pass(window_id, t0, true, true)
+            .expect("second self-requested pass must engage throttle");
+
+        let future = t0 + Duration::from_secs(5);
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, future),
+            future,
+            "future UserEvent::RequestRepaint must never be pulled earlier"
+        );
+
+        assert!(
+            !event_result_requests_rapid_repaint(
+                &Ok(EventResult::RepaintAt(window_id, future)),
+                window_id,
+                t0,
+            ),
+            "5 s RepaintAt must not count as a rapid repaint"
+        );
+
+        let clamped = clamp_event_result_for_throttle(
+            Ok(EventResult::RepaintAt(window_id, future)),
+            window_id,
+            t0,
+            next_allowed,
+        );
+        assert!(
+            matches!(clamped, Ok(EventResult::RepaintAt(id, when)) if id == window_id && when == future),
+            "future RepaintAt EventResult must never be pulled earlier"
+        );
+
+        let immediate = clamp_event_result_for_throttle(
+            Ok(EventResult::RepaintNext(window_id)),
+            window_id,
+            t0,
+            next_allowed,
+        );
+        assert!(
+            matches!(immediate, Ok(EventResult::RepaintAt(id, when)) if id == window_id && when == next_allowed),
+            "RepaintNext during a throttled loop must be pushed out to next_allowed"
+        );
+    }
+
+    #[test]
+    fn visibility_transition_clears_hidden_throttle_immediately() {
+        let mut throttles = InvisibleWindowThrottles::default();
+        let window_id = 1_u64;
+        let t0 = Instant::now();
+
+        let _ = throttles.finish_invisible_pass(window_id, t0, true, true);
+        assert!(
+            throttles
+                .finish_invisible_pass(window_id, t0, true, true)
+                .is_some(),
+            "looping hidden window should be throttled"
+        );
+
+        // Becoming visible during a pass clears the throttle immediately.
+        let t1 = t0 + Duration::from_millis(5);
+        assert_eq!(
+            throttles.finish_invisible_pass(window_id, t1, false, true),
+            None,
+            "becoming visible during a pass must clear throttle"
+        );
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, t1),
+            t1,
+            "subsequent repaint after becoming visible must not be throttled"
+        );
+
+        // Re-engage throttle, then simulate OS unminimize clearing it directly.
+        let _ = throttles.finish_invisible_pass(window_id, t1, true, true);
+        assert!(
+            throttles
+                .finish_invisible_pass(window_id, t1, true, true)
+                .is_some(),
+            "throttle should re-engage on a new hidden loop"
+        );
+        throttles.clear(window_id);
+        let t2 = t1 + Duration::from_millis(5);
+        assert_eq!(
+            throttles.clamp_user_repaint(window_id, t2),
+            t2,
+            "external visibility transition must clear throttle immediately"
+        );
+    }
+
+    #[test]
+    fn background_thread_and_other_viewport_repaints_do_not_trip_loop_detector() {
+        let guard = InvisiblePassGuard::enter(Some(ViewportId::ROOT));
+
+        // Another viewport requesting a rapid repaint on the main thread does not count.
+        note_repaint_requested_on_this_thread(ViewportId::from_hash_of("child"), Duration::ZERO);
+
+        // A background thread (e.g. global hotkey) requesting a repaint for ROOT does not count.
+        let handle = std::thread::Builder::new()
+            .name("hotkey-wakeup".to_owned())
+            .spawn(|| {
+                note_repaint_requested_on_this_thread(ViewportId::ROOT, Duration::ZERO);
+            })
+            .expect("background thread should spawn");
+        assert!(
+            handle.join().is_ok(),
+            "background thread should complete cleanly"
+        );
+
+        assert!(
+            !guard.finish(),
+            "background-thread and other-viewport repaints must not trip the main-thread detector"
+        );
+    }
 }

@@ -106,6 +106,8 @@ pub trait WinitApp {
 
     fn window_id_from_viewport_id(&self, id: ViewportId) -> Option<WindowId>;
 
+    fn viewport_id_from_window_id(&self, id: WindowId) -> Option<ViewportId>;
+
     fn save(&mut self);
 
     fn save_and_destroy(&mut self);

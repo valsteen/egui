@@ -292,6 +292,7 @@ impl<'app> WgpuWinitApp<'app> {
 
             egui_ctx.set_request_repaint_callback(move |info| {
                 log::trace!("request_repaint_callback: {info:?}");
+                super::run::note_repaint_requested_on_this_thread(info.viewport_id, info.delay);
                 let when = Instant::now() + info.delay;
                 let cumulative_pass_nr = info.current_cumulative_pass_nr;
 
@@ -426,6 +427,16 @@ impl WinitApp for WgpuWinitApp<'_> {
                 .as_ref()?
                 .id(),
         )
+    }
+
+    fn viewport_id_from_window_id(&self, id: WindowId) -> Option<ViewportId> {
+        self.running
+            .as_ref()?
+            .shared
+            .borrow()
+            .viewport_from_window
+            .get(&id)
+            .copied()
     }
 
     fn save(&mut self) {
